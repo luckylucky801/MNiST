@@ -34,8 +34,8 @@ def plot_signals_overall(original_signals, filtered_signals, title="Overall Sign
 
 
     plt.figure(figsize=(9, 6))
-    plt.plot(avg_original_signal, label="Before Filtering", alpha=0.6, color="#0057b8", linewidth=2)  # 深蓝色
-    plt.plot(avg_filtered_signal, label="After Filtering", alpha=0.8, color="#e76f51", linewidth=2)  # 柔和橙色
+    plt.plot(avg_original_signal, label="Before Filtering", alpha=0.6, color="#0057b8", linewidth=2)  
+    plt.plot(avg_filtered_signal, label="After Filtering", alpha=0.8, color="#e76f51", linewidth=2)  
 
     plt.title(title, fontsize=18, fontweight='bold', pad=15)
     plt.xlabel("Samples", fontsize=14, fontweight='bold', labelpad=10)
@@ -51,34 +51,28 @@ def plot_signals_overall(original_signals, filtered_signals, title="Overall Sign
 
     plt.show()
 
-
 def filter_frequency_signal(freq_signal, method='lowpass', cutoff=0.2, smooth=True, sigma=2, wavelet='db1', level=None):
 
+    adj_matrix = _fast_build_adjacency(freq_signal, cutoff)
+    
+    T_k = _fast_chebyshev_polynomials(adj_matrix, method, cutoff)
+    
     if method == 'lowpass':
-
-        fft_coeffs = fft(freq_signal)
-
-        freqs = np.fft.fftfreq(len(freq_signal))
-        lowpass_filter = np.abs(freqs) < cutoff  # 保留低于 cutoff 的频率
-
-        filtered_fft_coeffs = fft_coeffs * lowpass_filter
-        
-        filtered_signal = np.real(ifft(filtered_fft_coeffs))
-
+        filtered_signal = _fast_lowpass_filter(freq_signal, T_k, cutoff)
     elif method == 'wavelet':
-
-        coeffs = pywt.wavedec(freq_signal, wavelet, level=level)
-        threshold_value = np.sqrt(2 * np.log(freq_signal.size))  # 计算阈值
-        coeffs[1:] = [pywt.threshold(c, value=threshold_value, mode='soft') for c in coeffs[1:]]  # 软阈值
-        filtered_signal = pywt.waverec(coeffs, wavelet)[:len(freq_signal)]  # 重构信号
-
+        filtered_signal = _fast_wavelet_filter(freq_signal, T_k, level)
     else:
         raise ValueError("Unsupported method. Only 'lowpass' and 'wavelet' are supported.")
 
     if smooth:
-        filtered_signal = gaussian_filter1d(filtered_signal, sigma=sigma)
+        if freq_signal.ndim > 1:
+            for i in range(filtered_signal.shape[1]):
+                filtered_signal[:, i] = gaussian_filter1d(filtered_signal[:, i], sigma=sigma)
+        else:
+            filtered_signal = gaussian_filter1d(filtered_signal, sigma=sigma)
     
     return filtered_signal
+
 
 def obtain_chebyshev_features(adata, chebyshev_mtx_list, num_features):
 
@@ -86,19 +80,54 @@ def obtain_chebyshev_features(adata, chebyshev_mtx_list, num_features):
         X = adata.cpu().detach().numpy()
     else:
         X = adata if not ss.issparse(adata) else adata.A
+    X = normalize(X, norm='l2', axis=0)
+    n_samples, n_input_features = X.shape
+    total_features = n_input_features * (len(chebyshev_mtx_list) + 1)
+    if total_features > num_features * 4:
+        all_features = np.zeros((n_samples, num_features * 2))
+        feature_idx = 0
+    else:
+        all_features = np.zeros((n_samples, total_features))
+        feature_idx = 0
+    if feature_idx + n_input_features <= all_features.shape[1]:
+        all_features[:, feature_idx:feature_idx + n_input_features] = X
+        feature_idx += n_input_features
+    for i, T in enumerate(chebyshev_mtx_list):
+        if feature_idx >= all_features.shape[1]:
+            break
+        linear_features = T @ X
 
-    X = normalize(X, norm='max', axis=0)
+        if i < 3:  
+            if i % 2 == 0:
+                enhanced_features = np.tanh(linear_features * 0.5) 
+            else:
+                enhanced_features = linear_features * (1.0 + 0.1 * np.sign(linear_features))
+        else:
+            enhanced_features = linear_features
 
-    feature_list = [X]  
-    for T in chebyshev_mtx_list:
-        feature_list.append(T @ X)
+        weight = np.exp(-i * 0.15)  
+        weighted_features = weight * enhanced_features
 
+        remaining_slots = all_features.shape[1] - feature_idx
+        features_to_add = min(weighted_features.shape[1], remaining_slots)
+        
+        if features_to_add > 0:
+            all_features[:, feature_idx:feature_idx + features_to_add] = weighted_features[:, :features_to_add]
+            feature_idx += features_to_add
 
-    chebyshev_features = np.concatenate(feature_list, axis=1)
+    valid_features = all_features[:, :feature_idx]
 
-    chebyshev_features = normalize(chebyshev_features, norm='l2', axis=0)
+    if valid_features.shape[1] > num_features:
+
+        feature_vars = np.var(valid_features, axis=0)
+        top_indices = np.argpartition(feature_vars, -num_features)[-num_features:]
+        final_features = valid_features[:, top_indices]
+    else:
+        final_features = valid_features
+
+    final_features = normalize(final_features, norm='l2', axis=0)
     
-    return chebyshev_features[:, :num_features]  # 取前 num_features 个特征
+    return final_features
 
 
 def chebyshev_polynomials(adj_mtx, order=2):
@@ -106,24 +135,147 @@ def chebyshev_polynomials(adj_mtx, order=2):
     if not isinstance(adj_mtx, csr_matrix):
         adj_mtx = csr_matrix(adj_mtx)
 
-
     n = adj_mtx.shape[0]
-    I = identity(n, format='csr') 
-    deg_mtx = np.array(adj_mtx.sum(axis=1)).flatten()
+    I = identity(n, format='csr')
+    
 
-    deg_mtx[deg_mtx == 0] = 1  
+    deg_mtx = np.array(adj_mtx.sum(axis=1)).flatten()
+    deg_mtx[deg_mtx == 0] = 1 
     deg_inv_sqrt = np.diagflat(np.power(deg_mtx, -0.5))
 
-    lap_mtx = I - deg_inv_sqrt @ adj_mtx @ deg_inv_sqrt  
-
-
+    lap_mtx = I - deg_inv_sqrt @ adj_mtx @ deg_inv_sqrt
     lap_mtx = lap_mtx.toarray() if ss.issparse(lap_mtx) else np.asarray(lap_mtx)
+    
+    matrix_norm = np.linalg.norm(lap_mtx, 'fro')
+    if matrix_norm > 1e-10:
+        scaling_factor = min(2.0 / matrix_norm, 1.0)
+        lap_mtx_scaled = scaling_factor * lap_mtx
+    else:
+        lap_mtx_scaled = lap_mtx
 
-    T_k = [np.eye(n), lap_mtx]  # T0 = I, T1 = L
-    for k in range(2, order):
-        T_k.append(2 * lap_mtx @ T_k[-1] - T_k[-2])
+    effective_order = min(order, max(2, int(np.log2(n) // 2) + 1))
 
-    return T_k  
+    T_k = [np.eye(n)]  # T_0 = I
+    
+    if effective_order > 0:
+        T_k.append(lap_mtx_scaled)  # T_1 = L_scaled
+
+        for k in range(2, effective_order + 1):
+            T_next = 2.0 * lap_mtx_scaled @ T_k[-1] - T_k[-2]
+            T_k.append(T_next)
+    
+    return T_k
+
+
+def _fast_build_adjacency(signal, cutoff):
+
+    if signal.ndim > 1:
+        signal_repr = signal[:, :min(5, signal.shape[1])]
+        signal_1d = np.mean(signal_repr, axis=1)
+    else:
+        signal_1d = signal
+    
+    n = len(signal_1d)
+
+    row_indices = []
+    col_indices = []
+    data = []
+
+    window_size = min(8, int(1/cutoff * 3))
+    
+    for i in range(n):
+        for j in range(i+1, min(i + window_size, n)):
+            sim = np.exp(-abs(signal_1d[i] - signal_1d[j]) / cutoff)
+            if sim > 0.1:  
+                row_indices.extend([i, j])
+                col_indices.extend([j, i])
+                data.extend([sim, sim])
+    if len(data) > 0:
+        adj_sparse = csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
+        return adj_sparse.toarray()
+    else:
+        adj = np.eye(n)
+        for i in range(n-1):
+            adj[i, i+1] = adj[i+1, i] = 0.5
+        return adj
+
+
+def _fast_chebyshev_polynomials(adj_matrix, method, cutoff):
+
+    if method == 'lowpass':
+        order = max(2, min(4, int(8 * cutoff))) 
+    else:  
+        order = 3 
+    
+    return chebyshev_polynomials(adj_matrix, order)
+
+
+def _fast_lowpass_filter(signal, T_k, cutoff):
+
+    if signal.ndim > 1:
+        filtered = np.zeros_like(signal)
+        for i, T in enumerate(T_k):
+            weight = 1.0 if i / len(T_k) <= cutoff else np.exp(-(i / len(T_k) - cutoff) / cutoff)
+            filtered += weight * (T @ signal)
+        return filtered / len(T_k)
+    else:
+        filtered = np.zeros_like(signal)
+        for i, T in enumerate(T_k):
+            weight = 1.0 if i / len(T_k) <= cutoff else np.exp(-(i / len(T_k) - cutoff) / cutoff)
+            filtered += weight * (T @ signal)
+        return filtered / len(T_k)
+
+
+def _fast_wavelet_filter(signal, T_k, level):
+
+    if level is None:
+        level = min(3, len(T_k) - 1)  
+    
+    if signal.ndim > 1:
+
+        coeffs = []
+        current_signal = signal.copy()
+        
+        for i in range(min(level, len(T_k)-1)):
+            low_freq = T_k[0] @ current_signal
+            high_freq = T_k[i+1] @ current_signal
+            coeffs.append(high_freq)
+            current_signal = low_freq
+        
+        coeffs.append(current_signal)
+
+        threshold = np.std(signal) * 0.1 
+        for i in range(len(coeffs)-1):
+            coeffs[i] = np.where(np.abs(coeffs[i]) > threshold, coeffs[i], 0)
+
+        reconstructed = coeffs[-1]
+        for i in range(len(coeffs)-2, -1, -1):
+            reconstructed = reconstructed + coeffs[i]
+        
+        return reconstructed
+    else:
+
+        coeffs = []
+        current_signal = signal.copy()
+        
+        for i in range(min(level, len(T_k)-1)):
+            low_freq = T_k[0] @ current_signal
+            high_freq = T_k[i+1] @ current_signal
+            coeffs.append(high_freq)
+            current_signal = low_freq
+        
+        coeffs.append(current_signal)
+        
+        threshold = np.std(signal) * 0.1
+        for i in range(len(coeffs)-1):
+            coeffs[i] = np.where(np.abs(coeffs[i]) > threshold, coeffs[i], 0)
+        
+        reconstructed = coeffs[-1]
+        for i in range(len(coeffs)-2, -1, -1):
+            reconstructed = reconstructed + coeffs[i]
+        
+        return reconstructed
+
 
 class MNiST():
     def __init__(self, 
