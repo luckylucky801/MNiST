@@ -544,11 +544,11 @@ class MNiST():
         with torch.no_grad():
             self.model.eval()
             if self.deconvolution:
-                self.emb_rec = self.model(self.features, self.features_a, self.adj)[1]
+                self.emb_rec = self.model(self.features, self.features_a, self.adj)[0]
                 return self.emb_rec
             else:
                 if self.datatype in ['Stereo', 'Slide']:
-                    self.emb_rec = self.model(self.features, self.features_a, self.adj)[1]
+                    self.emb_rec = self.model(self.features, self.features_a, self.adj)[0]
                     self.emb_rec = F.normalize(self.emb_rec, p=2, dim=1).detach().cpu().numpy()
                 else:
                     self.emb_rec = self.model(self.features, self.features_a, self.adj)[1].detach().cpu().numpy()
